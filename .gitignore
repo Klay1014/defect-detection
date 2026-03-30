@@ -1,0 +1,12 @@
+data/
+*.tar.xz
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+results/heatmaps/*
+!results/heatmaps/.gitkeep
+*.pt
+*.pth
+*.onnx
+checkpoints/
+.env

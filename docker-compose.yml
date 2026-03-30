@@ -1,0 +1,15 @@
+version: "3.8"
+
+services:
+  defect-api:
+    build:
+      context: .
+      dockerfile: serve/Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount checkpoints so you don't need to rebuild after training
+      - ./checkpoints:/app/checkpoints:ro
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
