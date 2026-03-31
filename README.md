@@ -180,7 +180,8 @@ defect-detection/
 ├── checkpoints/                   # Trained models (gitignored)
 ├── notebooks/
 │   ├── 01_eda.ipynb              # Data exploration + OpenCV showcase
-│   └── kaggle_train.ipynb        # Full training notebook (Kaggle GPU)
+│   ├── kaggle_train.ipynb        # Training code (clean, no outputs)
+│   └── kaggle_results.ipynb      # Full results with charts (Kaggle T4)
 ├── src/
 │   ├── dataset.py                # PyTorch Dataset + OpenCV + augmentation
 │   ├── model.py                  # ResNet18 Autoencoder
