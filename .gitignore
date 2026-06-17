@@ -10,3 +10,5 @@ results/heatmaps/*
 *.onnx
 checkpoints/
 .env
+.DS_Store
+mvtec-ad-manufac*.ipynb
