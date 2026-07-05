@@ -63,11 +63,37 @@ The system compares two unsupervised approaches: a **reconstruction-based Autoen
 
 ## Results
 
-Evaluated on 3 MVTec AD categories (trained on Kaggle T4 GPU):
+### Headline — `bottle`, calibrated and reproducible locally
 
-| Category | Autoencoder |  | PatchCore |  |
-|----------|:-----------:|:-----------:|:---------:|:-----------:|
-|          | Image AUROC | Pixel AUROC | Image AUROC | Pixel AUROC |
+Both methods are served side by side. Decision thresholds are calibrated **without
+ever touching the test set** — only on held-out normal images (see
+[Evaluation notes](#evaluation-notes--honest-limitations)). Metrics are framed in
+manufacturing terms, not raw accuracy:
+
+| Method | Image AUROC | Escape rate ↓ | Overkill rate ↓ | Latency (MPS) | Latency (CPU) |
+|--------|:-----------:|:------:|:------:|:------:|:------:|
+| Autoencoder (baseline) | 0.859 | 38.1% | 5.0% | 13 ms · 78 FPS | 35 ms · 28 FPS |
+| **PatchCore (SOTA)** | **1.000** | **1.6%** | **0.0%** | 34 ms · 30 FPS | 57 ms · 18 FPS |
+
+- **Escape rate** = real defects passed as OK (the costly failure in QA).
+- **Overkill rate** = good units wrongly scrapped (yield loss).
+- Reproduce: `python src/build_patchcore.py && python src/build_ae_threshold.py && python src/benchmark.py`.
+
+![Autoencoder vs PatchCore — calibrated, leakage-aware](results/demo_comparison.png)
+
+The Autoencoder misses both the broken and contamination defects — its error map
+fixates on the bottle opening rather than the defect — while PatchCore localises
+both. This is why **pixel-level localisation, not image-level accuracy alone,
+drives method choice on a production line.**
+
+### Broader benchmark (earlier Kaggle T4 runs)
+
+> Image/pixel AUROC across 3 categories from `src/patchcore.py` (raw, uncalibrated
+> eval). Only `bottle` is currently built through the calibrated serving pipeline
+> above; re-validating carpet/hazelnut the same way is tracked work.
+
+| Category | AE Image | AE Pixel | PatchCore Image | PatchCore Pixel |
+|----------|:--------:|:--------:|:---------------:|:---------------:|
 | Bottle   | 0.7992 | 0.3228 | **0.9984** | **0.9770** |
 | Carpet   | 0.6364 | 0.6023 | **0.8535** | **0.9760** |
 | Hazelnut | 0.9846 | 0.2338 | **0.9968** | **0.9801** |
@@ -75,26 +101,27 @@ Evaluated on 3 MVTec AD categories (trained on Kaggle T4 GPU):
 
 **Key insight**: PatchCore dramatically improves pixel-level localization (**0.39 → 0.98** AUROC) because it scores each patch independently via nearest-neighbor distance, rather than relying on global reconstruction quality.
 
-> Run `python src/visualize.py --category bottle` to generate heatmap images in `results/heatmaps/`.
-
 ---
 
 ## Inference Pipeline
+
+A single `/predict` call scores the image with **both methods** and returns their
+calibrated verdicts together, so the quality gap is visible in one response:
 
 ```mermaid
 graph LR
     A[Upload Image<br/>PNG / JPG] --> B[cv2.imdecode]
     B --> C[OpenCV Preprocess<br/>resize · blur · BGR→RGB]
     C --> D[ImageNet Normalize<br/>ToTensor]
-    D --> E[Autoencoder<br/>forward pass]
-    E --> F[Pixel-wise MSE<br/>reconstruction error]
-    F --> G["Anomaly Score<br/>max(error)"]
-    F --> H[Heatmap<br/>JET colormap → base64]
-    G --> I[JSON Response<br/>score + heatmap + is_anomaly]
-    H --> I
+    D --> E[Autoencoder<br/>max pixel MSE]
+    D --> P[PatchCore<br/>NN distance to memory bank]
+    E --> F[score + calibrated threshold<br/>→ verdict + heatmap]
+    P --> F
+    F --> I[JSON Response<br/>both methods side by side]
 
     style A fill:#e8f5e9,stroke:#2e7d32,color:#000
     style E fill:#bbdefb,stroke:#1565c0,color:#000
+    style P fill:#b3e5fc,stroke:#0277bd,color:#000
     style I fill:#ffe0b2,stroke:#e65100,color:#000
 ```
 
@@ -102,15 +129,17 @@ graph LR
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/health` | GET | Health check (model loaded? device?) |
-| `/predict` | POST | Upload image → anomaly score + heatmap |
-| `/load-model` | POST | Switch to different category model |
+| `/health` | GET | Health check (category, device, which methods loaded) |
+| `/predict` | POST | Upload image → **AE + PatchCore** scores, calibrated verdicts, heatmaps |
+| `/load-model` | POST | Switch category (whitelist-validated; atomic swap of both models) |
 
 ```bash
-# Local
+# Local — build artifacts once, then serve
+python src/build_patchcore.py   --category bottle
+python src/build_ae_threshold.py --category bottle
 uvicorn serve.app:app --host 0.0.0.0 --port 8000
 
-# Docker
+# Docker (ResNet18 weights baked in → offline-safe startup)
 docker-compose up --build
 
 # Test
@@ -123,17 +152,39 @@ curl -X POST http://localhost:8000/predict -F "file=@test_image.png"
 
 ### Autoencoder (Baseline)
 
-- **Encoder**: Pretrained ResNet18 conv layers → 512-d features at 8×8
+- **Encoder**: ResNet18 conv layers → 512-d features at 8×8
 - **Decoder**: 5 transposed conv layers → reconstruct 256×256 RGB
-- **Anomaly score**: Max pixel-wise MSE; threshold via Youden's J statistic
+- **Anomaly score**: Max pixel-wise MSE; threshold calibrated to a target overkill
+  rate on held-out normal images (`build_ae_threshold.py`)
+- *Intentionally a weak baseline* — see [Evaluation notes](#evaluation-notes--honest-limitations).
 
 ### PatchCore (SOTA)
 
 - **Features**: ResNet18 layer2 (128-ch) + layer3 (256-ch) → 384-dim patches
-- **Memory bank**: Normal training patches, 10% random coreset subsampling
+- **Memory bank**: Normal training patches, 10% random coreset subsampling, with a
+  disjoint slice of normals held out purely for threshold calibration
 - **Scoring**: Nearest-neighbor L2 distance → upsample + Gaussian smooth (σ=4)
 
 > Reference: *Roth et al., "Towards Total Recall in Industrial Anomaly Detection", CVPR 2022*
+
+---
+
+## Evaluation notes & honest limitations
+
+- **No test leakage.** Both thresholds are fit only on normal images; the test set
+  is never used for calibration. For **PatchCore** the calibration normals are also
+  *held out from the memory bank*, so it is a true held-out calibration. For the
+  **Autoencoder** the calibration normals were seen during AE training (the AE is
+  trained on all `train/good`), so its threshold is calibrated on training-seen
+  normals — no test leakage, but not a clean held-out set. If anything this flatters
+  the AE, and PatchCore still wins decisively.
+- **The AE is a deliberately weak baseline.** Its training objective has a
+  normalisation mismatch (sigmoid output vs. ImageNet-normalised input in the MSE),
+  which caps its quality. It is kept as a *reference point*, not a tuned competitor.
+- **Single calibration split.** Threshold/escape/overkill come from one random split
+  (seed 0, ~41 calibration images); numbers are not yet averaged over seeds.
+- **Coverage.** Only `bottle` is built through the calibrated pipeline so far; the
+  multi-category table above is from earlier raw `patchcore.py` runs.
 
 ---
 
@@ -154,6 +205,7 @@ graph BT
     EX[export_onnx.py] --> MD
     AP[serve/app.py] --> DS
     AP --> MD
+    AP --> PC
 
     style DS fill:#c8e6c9,stroke:#2e7d32,color:#000
     style MD fill:#c8e6c9,stroke:#2e7d32,color:#000
@@ -188,13 +240,17 @@ defect-detection/
 │   ├── patchcore.py              # PatchCore (SOTA method)
 │   ├── train.py                  # Training script
 │   ├── evaluate.py               # AUROC/F1 evaluation
+│   ├── build_patchcore.py        # Build + persist memory bank, calibrate threshold
+│   ├── build_ae_threshold.py     # Calibrate AE baseline threshold
+│   ├── benchmark.py              # Inference latency / FPS (AE vs PatchCore)
+│   ├── make_demo.py              # Render results/demo_comparison.png
 │   ├── visualize.py              # Anomaly heatmap generation
 │   └── export_onnx.py           # ONNX export + benchmark
 ├── serve/
-│   ├── app.py                    # FastAPI inference API
-│   └── Dockerfile                # Multi-stage Docker build
+│   ├── app.py                    # FastAPI API (serves AE + PatchCore side by side)
+│   └── Dockerfile                # Multi-stage build (ResNet18 weights baked in)
 └── results/
-    └── heatmaps/                 # Generated visualizations
+    └── demo_comparison.png       # AE vs PatchCore demo figure
 ```
 
 ## Quick Start
@@ -212,16 +268,15 @@ python src/train.py --category bottle --epochs 100 --augment
 # 4. Evaluate
 python src/evaluate.py --category bottle
 
-# 5. Run PatchCore
-python src/patchcore.py --category bottle
+# 5. Build the served artifacts (memory bank + calibrated thresholds)
+python src/build_patchcore.py   --category bottle
+python src/build_ae_threshold.py --category bottle
 
-# 6. Generate heatmaps
-python src/visualize.py --category bottle
+# 6. Benchmark + demo figure
+python src/benchmark.py --category bottle
+python src/make_demo.py
 
-# 7. Export to ONNX + benchmark
-python src/export_onnx.py --checkpoint checkpoints/bottle_best.pt --benchmark
-
-# 8. Serve API (or: docker-compose up --build)
+# 7. Serve API (requires step 5; or: docker-compose up --build)
 uvicorn serve.app:app --host 0.0.0.0 --port 8000
 ```
 
