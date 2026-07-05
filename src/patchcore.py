@@ -57,6 +57,29 @@ class FeatureExtractor(nn.Module):
         return torch.cat([feat2, feat3_up], dim=1)       # (B, 384, 32, 32)
 
 
+# ── Shared scoring helper ────────────────────────────────────────────────────
+
+@torch.no_grad()
+def patchcore_anomaly_map(extractor, memory_bank, img_tensor, size=256, sigma=4):
+    """Anomaly map for one image: smoothed nearest-neighbour patch distance.
+
+    Single source of truth used by serving, the build script, benchmarking and the
+    demo renderer. `img_tensor` may be (3,H,W) or (1,3,H,W); it and `memory_bank`
+    must already be on the same device as `extractor`.
+
+    Returns a (size, size) float numpy array.
+    """
+    if img_tensor.dim() == 3:
+        img_tensor = img_tensor.unsqueeze(0)
+    feats = extractor(img_tensor)                      # (1, C, H, W)
+    _, C, H, W = feats.shape
+    patches = feats[0].permute(1, 2, 0).reshape(-1, C)
+    dists = torch.cdist(patches, memory_bank).min(dim=1).values
+    m = dists.cpu().numpy().reshape(H, W)
+    m = np.array(Image.fromarray(m).resize((size, size), Image.BILINEAR))
+    return gaussian_filter(m, sigma=sigma)
+
+
 # ── PatchCore Algorithm ─────────────────────────────────────────────────────
 
 @torch.no_grad()

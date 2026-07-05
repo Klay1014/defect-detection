@@ -9,9 +9,13 @@ Pillow>=10.0
 tqdm>=4.65
 jupyter>=1.0
 scipy>=1.11
-# Serving
-fastapi>=0.104
-uvicorn>=0.24
+# Serving — pinned to a tested, mutually-compatible set.
+# (httpx>=0.28 dropped the `app=` arg that starlette 0.27's TestClient relies on,
+#  which breaks `from fastapi.testclient import TestClient`; keep httpx <0.28.)
+fastapi==0.104.1
+starlette==0.27.0
+uvicorn==0.24.0
+httpx==0.27.2
 python-multipart>=0.0.6
 # ONNX export
 onnx>=1.15

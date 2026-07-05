@@ -15,6 +15,11 @@ RUN apt-get update && \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Bake torchvision's ResNet18 ImageNet weights into the image so PatchCore's
+# FeatureExtractor starts with no network access (offline-safe deployment).
+ENV TORCH_HOME=/opt/torch
+RUN python -c "import torchvision.models as m; m.resnet18(weights=m.ResNet18_Weights.DEFAULT)"
+
 # ── Application stage ───────────────────────────────────────────────────────
 FROM base AS app
 

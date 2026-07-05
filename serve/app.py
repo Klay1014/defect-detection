@@ -1,16 +1,21 @@
-"""FastAPI inference server for anomaly detection.
+"""FastAPI inference server — Autoencoder baseline vs PatchCore (SOTA), side by side.
+
+Each /predict call scores the uploaded image with BOTH methods and returns their
+calibrated verdicts together, so the quality gap is visible in one response.
+Thresholds are calibrated leakage-free (held-out normal images only) by
+src/build_patchcore.py and src/build_ae_threshold.py.
 
 Endpoints:
-    POST /predict   — Upload image → get anomaly score + heatmap
-    GET  /health    — Health check
+    GET  /health    — health check (which methods/category loaded)
+    POST /predict   — upload image → AE + PatchCore scores, verdicts, heatmaps
+    POST /load-model?category=bottle — switch category (loads both methods)
 
-Usage:
+Run:
     uvicorn serve.app:app --host 0.0.0.0 --port 8000
 """
 
-import io
-import sys
 import base64
+import sys
 from pathlib import Path
 
 import cv2
@@ -19,135 +24,190 @@ import torch
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
 
-# Add src to path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from model import AnomalyAutoencoder
-from dataset import opencv_preprocess
-from torchvision import transforms
-
-# ── App setup ───────────────────────────────────────────────────────────────
+from model import AnomalyAutoencoder                          # noqa: E402
+from dataset import opencv_preprocess                         # noqa: E402
+from patchcore import FeatureExtractor, patchcore_anomaly_map  # noqa: E402
+from torchvision import transforms                            # noqa: E402
 
 app = FastAPI(
-    title="Defect Detection API",
-    description="Anomaly detection for manufacturing quality inspection",
-    version="1.0.0",
+    title="Defect Detection API — AE vs PatchCore",
+    description="Unsupervised anomaly detection for manufacturing inspection",
+    version="2.0.0",
 )
 
-# Global model (loaded once at startup)
-MODEL = None
-DEVICE = None
+CKPT_DIR = PROJECT_ROOT / "checkpoints"
+DEFAULT_CATEGORY = "bottle"
 TRANSFORM = transforms.Compose([
     transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                         std=[0.229, 0.224, 0.225]),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
 ])
 
-CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints"
-DEFAULT_CATEGORY = "bottle"
+# Global state, populated by load_category()
+STATE = {"category": None, "device": None, "ae": None, "patch": None}
 
 
-def load_model(category: str = DEFAULT_CATEGORY):
-    """Load model checkpoint into global state."""
-    global MODEL, DEVICE
-
+def _device() -> str:
     if torch.cuda.is_available():
-        DEVICE = "cuda"
-    elif torch.backends.mps.is_available():
-        DEVICE = "mps"
-    else:
-        DEVICE = "cpu"
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
 
-    MODEL = AnomalyAutoencoder(pretrained=False).to(DEVICE)
-    ckpt_path = CHECKPOINT_DIR / f"{category}_best.pt"
 
-    if not ckpt_path.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+# Required checkpoint files per category (all three must exist to serve it).
+_REQUIRED = ("{c}_best.pt", "{c}_ae_calib.pt", "{c}_patchcore.pt")
 
-    ckpt = torch.load(str(ckpt_path), map_location=DEVICE, weights_only=True)
-    MODEL.load_state_dict(ckpt["model_state_dict"])
-    MODEL.eval()
-    print(f"Model loaded: {category} (epoch {ckpt['epoch']}, device={DEVICE})")
+
+def available_categories():
+    """Categories that have every required checkpoint present — the whitelist."""
+    cats = []
+    for p in sorted(CKPT_DIR.glob("*_patchcore.pt")):
+        c = p.name[:-len("_patchcore.pt")]
+        if all((CKPT_DIR / f.format(c=c)).exists() for f in _REQUIRED):
+            cats.append(c)
+    return cats
+
+
+def load_category(category: str = DEFAULT_CATEGORY):
+    """Load a category's models, then swap into global STATE atomically.
+
+    Everything is loaded into locals first; STATE is only mutated once all
+    artifacts are present and parsed, so a missing/invalid checkpoint can never
+    leave the server in a half-loaded state. `category` is validated against the
+    checkpoint whitelist to avoid path injection.
+    """
+    if category not in available_categories():
+        raise FileNotFoundError(
+            f"Category '{category}' not available. Have: {available_categories()}")
+
+    device = _device()
+
+    # ── Autoencoder + calibrated threshold (load into locals) ───────────────
+    ae_model = AnomalyAutoencoder(pretrained=False).to(device)
+    ae_ckpt = torch.load(CKPT_DIR / f"{category}_best.pt",
+                         map_location=device, weights_only=True)
+    ae_model.load_state_dict(ae_ckpt["model_state_dict"])
+    ae_model.eval()
+    ae_cal = torch.load(CKPT_DIR / f"{category}_ae_calib.pt",
+                        map_location="cpu", weights_only=False)
+    new_ae = {"model": ae_model, "threshold": ae_cal["threshold"],
+              "meta": ae_cal["meta"]}
+
+    # ── PatchCore memory bank + calibrated threshold (load into locals) ─────
+    pc = torch.load(CKPT_DIR / f"{category}_patchcore.pt",
+                    map_location="cpu", weights_only=False)
+    new_patch = {
+        "extractor": FeatureExtractor().eval().to(device),
+        "memory_bank": pc["memory_bank"].to(device),
+        "threshold": pc["threshold"],
+        "feat_hw": pc["feat_hw"],
+        "size": pc["size"],
+        "meta": pc["meta"],
+    }
+
+    # ── Atomic swap: only mutate STATE once everything succeeded ─────────────
+    STATE.update({"category": category, "device": device,
+                  "ae": new_ae, "patch": new_patch})
+    print(f"Loaded '{category}' on {device}: AE + PatchCore ready")
 
 
 @app.on_event("startup")
-async def startup():
-    """Load default model on server start."""
+async def _startup():
     try:
-        load_model(DEFAULT_CATEGORY)
+        load_category(DEFAULT_CATEGORY)
     except FileNotFoundError as e:
-        print(f"Warning: {e}")
-        print("Start the server after training a model.")
+        print(f"Warning: {e}\nRun build_patchcore.py / build_ae_threshold.py first.")
 
 
-# ── Endpoints ───────────────────────────────────────────────────────────────
+# ── Scoring helpers ──────────────────────────────────────────────────────────
+
+def _heatmap_b64(error_map: np.ndarray) -> str:
+    norm = (error_map / (error_map.max() + 1e-8) * 255).astype(np.uint8)
+    color = cv2.applyColorMap(norm, cv2.COLORMAP_JET)
+    _, buf = cv2.imencode(".png", color)
+    return base64.b64encode(buf).decode("utf-8")
+
+
+@torch.no_grad()
+def _score_ae(img_tensor):
+    recon = STATE["ae"]["model"](img_tensor)
+    err = ((img_tensor - recon) ** 2).mean(dim=1).squeeze(0).cpu().numpy()
+    th = STATE["ae"]["threshold"]
+    m = STATE["ae"]["meta"]
+    return {
+        "method": "autoencoder", "label": "Autoencoder (baseline)",
+        "anomaly_score": round(float(err.max()), 4), "threshold": round(th, 4),
+        "is_anomaly": bool(err.max() >= th),
+        "val_image_auroc": round(m["image_auroc"], 4),
+        "val_escape_rate": round(m["escape"], 4),
+        "val_overkill_rate": round(m["overkill"], 4),
+        "heatmap_base64": _heatmap_b64(err),
+    }
+
+
+@torch.no_grad()
+def _score_patchcore(img_tensor):
+    p = STATE["patch"]
+    m = patchcore_anomaly_map(p["extractor"], p["memory_bank"], img_tensor, p["size"])
+    th = p["threshold"]
+    meta = p["meta"]
+    return {
+        "method": "patchcore", "label": "PatchCore (SOTA)",
+        "anomaly_score": round(float(m.max()), 4), "threshold": round(th, 4),
+        "is_anomaly": bool(m.max() >= th),
+        "val_image_auroc": round(meta["image_auroc"], 4),
+        "val_escape_rate": round(meta["escape"], 4),
+        "val_overkill_rate": round(meta["overkill"], 4),
+        "heatmap_base64": _heatmap_b64(m),
+    }
+
+
+# ── Endpoints ────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 async def health():
-    """Health check endpoint."""
     return {
         "status": "healthy",
-        "model_loaded": MODEL is not None,
-        "device": DEVICE,
+        "category": STATE["category"],
+        "device": STATE["device"],
+        "methods_loaded": {
+            "autoencoder": STATE["ae"] is not None,
+            "patchcore": STATE["patch"] is not None,
+        },
     }
 
 
 @app.post("/predict")
-async def predict(
-    file: UploadFile = File(..., description="Image file (PNG/JPG)"),
-    threshold: float = 0.5,
-):
-    """Predict anomaly score for uploaded image.
+async def predict(file: UploadFile = File(..., description="Image (PNG/JPG)")):
+    """Score the image with BOTH methods and return their calibrated verdicts."""
+    if STATE["ae"] is None or STATE["patch"] is None:
+        raise HTTPException(503, "Models not loaded")
 
-    Returns:
-        anomaly_score: Maximum reconstruction error (higher = more anomalous)
-        is_anomaly: Boolean based on threshold
-        heatmap_base64: Base64-encoded anomaly heatmap (PNG)
-    """
-    if MODEL is None:
-        raise HTTPException(status_code=503, detail="Model not loaded")
-
-    # Read image
     contents = await file.read()
-    nparr = np.frombuffer(contents, np.uint8)
-    img_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    img_bgr = cv2.imdecode(np.frombuffer(contents, np.uint8), cv2.IMREAD_COLOR)
     if img_bgr is None:
-        raise HTTPException(status_code=400, detail="Invalid image file")
+        raise HTTPException(400, "Invalid image file")
 
-    # Preprocess
     img_rgb = opencv_preprocess(img_bgr, size=256)
-    img_tensor = TRANSFORM(img_rgb).unsqueeze(0).to(DEVICE)
+    img_tensor = TRANSFORM(img_rgb).unsqueeze(0).to(STATE["device"])
 
-    # Inference
-    with torch.no_grad():
-        recon = MODEL(img_tensor)
-
-    # Anomaly map: pixel-wise MSE
-    error = ((img_tensor - recon) ** 2).mean(dim=1).squeeze(0).cpu().numpy()
-    anomaly_score = float(error.max())
-    is_anomaly = anomaly_score >= threshold
-
-    # Generate heatmap as base64 PNG
-    heatmap_norm = (error / (error.max() + 1e-8) * 255).astype(np.uint8)
-    heatmap_color = cv2.applyColorMap(heatmap_norm, cv2.COLORMAP_JET)
-    _, buf = cv2.imencode(".png", heatmap_color)
-    heatmap_b64 = base64.b64encode(buf).decode("utf-8")
-
+    ae = _score_ae(img_tensor)
+    pc = _score_patchcore(img_tensor)
     return JSONResponse({
-        "anomaly_score": round(anomaly_score, 6),
-        "is_anomaly": is_anomaly,
-        "threshold": threshold,
-        "heatmap_base64": heatmap_b64,
+        "category": STATE["category"],
         "image_size": list(img_bgr.shape[:2]),
+        "methods": {"autoencoder": ae, "patchcore": pc},
+        "methods_agree": ae["is_anomaly"] == pc["is_anomaly"],
     })
 
 
 @app.post("/load-model")
-async def load_model_endpoint(category: str = "bottle"):
-    """Switch to a different category's model."""
+async def load_model_endpoint(category: str = DEFAULT_CATEGORY):
     try:
-        load_model(category)
+        load_category(category)
         return {"status": "ok", "category": category}
     except FileNotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+        raise HTTPException(404, str(e))
