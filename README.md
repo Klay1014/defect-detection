@@ -86,11 +86,41 @@ fixates on the bottle opening rather than the defect — while PatchCore localis
 both. This is why **pixel-level localisation, not image-level accuracy alone,
 drives method choice on a production line.**
 
-### Broader benchmark (earlier Kaggle T4 runs)
+### Multi-category benchmark — calibrated pipeline (9 / 15 categories)
 
-> Image/pixel AUROC across 3 categories from `src/patchcore.py` (raw, uncalibrated
-> eval). Only `bottle` is currently built through the calibrated serving pipeline
-> above; re-validating carpet/hazelnut the same way is tracked work.
+PatchCore built through the same leakage-aware pipeline (`build_patchcore.py`,
+seed 0, 2% target overkill), evaluated on the untouched test set:
+
+| Category | Image AUROC | Escape rate ↓ | Overkill rate ↓ |
+|----------|:-----------:|:------:|:------:|
+| bottle    | **1.000** | 1.6%  | 0.0%  |
+| hazelnut  | 0.990 | 2.9%  | 7.5%  |
+| leather   | 0.988 | 2.2%  | 15.6% |
+| metal_nut | 0.967 | 5.4%  | 18.2% |
+| wood      | 0.964 | 6.7%  | 21.1% |
+| zipper    | 0.932 | 44.5% | 6.2%  |
+| carpet    | 0.841 | 32.6% | 10.7% |
+| tile      | 0.698 | 79.8% | 3.0%  |
+| grid      | 0.677 | 98.2% | 0.0%  |
+| **Avg**   | **0.895** | — | — |
+
+Three findings worth reading before the average:
+
+1. **Objects and coarse textures work; fine regular textures fail.** `grid` and
+   `tile` collapse (AUROC ≈ 0.68–0.70) because ResNet18 layer2/3 features at
+   256 px can't resolve subtle deformations in fine periodic patterns. The
+   original paper reaches ~0.98 on these with WideResNet-50, center-crop and
+   greedy k-center coreset — backbone upgrade is the tracked fix, and this
+   failure mode is left visible on purpose.
+2. **Separability ≠ deployable threshold.** `zipper` has decent AUROC (0.93) yet
+   44% escape: defect scores overlap the normal tail, so the overkill-controlled
+   threshold sits above many true defects. On a real line this is the difference
+   between "the model ranks well" and "the operating point ships".
+3. **Overkill overshoots its 2% target** (up to 21% on `wood`) because thresholds
+   come from one small calibration split (44–78 normals, single seed) — see
+   [Evaluation notes](#evaluation-notes--honest-limitations).
+
+### Pixel-level localisation (earlier Kaggle T4 runs, uncalibrated)
 
 | Category | AE Image | AE Pixel | PatchCore Image | PatchCore Pixel |
 |----------|:--------:|:--------:|:---------------:|:---------------:|
@@ -183,8 +213,10 @@ curl -X POST http://localhost:8000/predict -F "file=@test_image.png"
   which caps its quality. It is kept as a *reference point*, not a tuned competitor.
 - **Single calibration split.** Threshold/escape/overkill come from one random split
   (seed 0, ~41 calibration images); numbers are not yet averaged over seeds.
-- **Coverage.** Only `bottle` is built through the calibrated pipeline so far; the
-  multi-category table above is from earlier raw `patchcore.py` runs.
+- **Coverage.** 9 of 15 MVTec categories are built through the calibrated pipeline
+  (all checkpoints reproducible via `build_patchcore.py --category <name>`). The
+  remaining 6 and the fine-texture fixes (stronger backbone, greedy coreset) are
+  tracked work.
 
 ---
 
