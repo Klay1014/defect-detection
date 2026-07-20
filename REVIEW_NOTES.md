@@ -30,7 +30,24 @@ Addressing the review findings:
   `make_demo.py`, `benchmark.py` now all call it (rebuild verified bit-identical
   metrics). Root scratch notebooks moved into `notebooks/` (still gitignored).
 
-Remaining open: single-seed calibration, multi-category coverage (only `bottle` built).
+## Review resolution (2026-07-15)
+
+- **Healthcheck false-positive** → ✅ `/health` now returns 503 with
+  `status=unavailable` unless both AE and PatchCore are loaded, so Docker's
+  healthcheck fails when `/predict` would fail.
+- **Concurrent `/load-model` race** → ✅ `/predict` snapshots the current category,
+  device, AE state and PatchCore state once per request before scoring.
+- **Docker context too large** → ✅ added `.dockerignore`; `data/`, notebooks,
+  caches and unused checkpoints are excluded while the bottle serving checkpoints
+  remain included.
+- **AE calibration wording** → ✅ README headline and Methods now say normal-only
+  calibration for AE, not held-out from AE fitting.
+- **Review notes stale items** → ✅ known-issues list below now matches the current
+  state.
+
+Remaining open: single-seed calibration, fine-texture failure modes (`grid` /
+`tile`), and dual-method serving beyond `bottle` (PatchCore exists for 9 classes,
+but AE checkpoints/calibrations are only available for bottle).
 
 ## What changed
 
@@ -38,7 +55,7 @@ Remaining open: single-seed calibration, multi-category coverage (only `bottle` 
 |------|--------|---------|
 | `serve/app.py` | modified | Was serving only the Autoencoder with a hardcoded `threshold=0.5` (flagged *everything* as anomalous). Rewritten to v2: loads **both** AE + PatchCore and `/predict` returns both verdicts side by side, using calibrated thresholds. |
 | `src/build_patchcore.py` | new | Builds + persists a PatchCore memory bank to `checkpoints/{cat}_patchcore.pt`. Threshold calibrated on a **held-out slice of normal training images** (never the test set). |
-| `src/build_ae_threshold.py` | new | Same leakage-aware calibration for the AE baseline → `checkpoints/{cat}_ae_calib.pt`. Uses the same seed/split as the PatchCore builder, so both are calibrated on the *same* held-out normals. |
+| `src/build_ae_threshold.py` | new | Normal-only, no-test-leakage calibration for the AE baseline → `checkpoints/{cat}_ae_calib.pt`. The AE has already been fit on `train/good`, so these normals are not held out from AE training. |
 | `src/benchmark.py` | new | Per-image latency (ms) + throughput (FPS) for both methods, CPU + MPS. |
 | `src/make_demo.py` | new | Renders `results/demo_comparison.png` (normal / broken / contamination × input / AE / PatchCore). |
 
@@ -53,27 +70,23 @@ Measured on `bottle` (leakage-free calibration, target overkill 2%):
 
 These are deliberate trade-offs or known gaps — not blind spots:
 
-1. **Duplicated PatchCore scoring logic.** The cdist → reshape → resize → gaussian
-   pipeline is re-implemented in `build_patchcore.py`, `serve/app.py`,
-   `make_demo.py`, and `benchmark.py`. Should be factored into one shared helper
-   (probably in `src/patchcore.py`). Left un-refactored for now — open to the
-   cleanest factoring.
-2. **`torch.load(..., weights_only=False)`** on the `*_patchcore.pt` / `*_ae_calib.pt`
+1. **`torch.load(..., weights_only=False)`** on the `*_patchcore.pt` / `*_ae_calib.pt`
    files (they store a dict with numpy arrays + a tensor). Fine for our own local
    artifacts; flag if you'd prefer a safer serialization (e.g. `safetensors` +
    separate JSON for scalars).
-3. **Single random calibration split (seed 0), small calib set (~41 imgs).** No
+2. **Single random calibration split (seed 0), small calib set (~41 imgs for
+   bottle).** No
    cross-validation / confidence interval on the escape/overkill numbers. Is a
    single split defensible for a portfolio claim, or should I report mean±sd over
    a few seeds?
-4. **AE anomaly score = max pixel MSE**, which is noise-sensitive and normalised
+3. **AE anomaly score = max pixel MSE**, which is noise-sensitive and normalised
    per-image for the heatmap (not comparable across images). This is the baseline,
    so weak behaviour is expected/intended — but confirm the framing is honest.
-5. **Only `bottle` is built.** Other categories need the two build scripts run
-   (data is downloaded for ~10 categories).
-6. **README is stale** (still claims AE 0.7992 and a 3-category table, no
-   escape/overkill, no latency, no demo image). Not yet updated — intentionally
-   left until the numbers were reviewed.
+4. **Dual-method serving is currently bottle-only.** PatchCore checkpoints exist
+   for 9 categories, but `/predict` requires AE + AE calibration + PatchCore, and
+   only bottle currently has all three.
+5. **Fine regular textures still need a stronger PatchCore variant.** `grid` and
+   `tile` have poor calibrated AUROC/escape with ResNet18 layer2/3 at 256 px.
 
 ## How to reproduce
 

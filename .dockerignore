@@ -1,0 +1,21 @@
+.git/
+.DS_Store
+.env
+
+data/
+notebooks/
+results/heatmaps/
+
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+*.ipynb
+*.tar.xz
+*.onnx
+
+# Keep the Docker context small while still allowing the bottle demo service
+# to start from the checkpoints copied by serve/Dockerfile.
+checkpoints/*
+!checkpoints/bottle_best.pt
+!checkpoints/bottle_ae_calib.pt
+!checkpoints/bottle_patchcore.pt

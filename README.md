@@ -66,7 +66,9 @@ The system compares two unsupervised approaches: a **reconstruction-based Autoen
 ### Headline — `bottle`, calibrated and reproducible locally
 
 Both methods are served side by side. Decision thresholds are calibrated **without
-ever touching the test set** — only on held-out normal images (see
+ever touching the test set**. PatchCore uses normal images held out from its
+memory bank; the Autoencoder baseline uses normal-only calibration scores from a
+model already fit on `train/good` (see
 [Evaluation notes](#evaluation-notes--honest-limitations)). Metrics are framed in
 manufacturing terms, not raw accuracy:
 
@@ -77,6 +79,7 @@ manufacturing terms, not raw accuracy:
 
 - **Escape rate** = real defects passed as OK (the costly failure in QA).
 - **Overkill rate** = good units wrongly scrapped (yield loss).
+- Latency was measured locally; exact CPU/MPS numbers vary with hardware and load.
 - Reproduce: `python src/build_patchcore.py && python src/build_ae_threshold.py && python src/benchmark.py`.
 
 ![Autoencoder vs PatchCore — calibrated, leakage-aware](results/demo_comparison.png)
@@ -185,7 +188,8 @@ curl -X POST http://localhost:8000/predict -F "file=@test_image.png"
 - **Encoder**: ResNet18 conv layers → 512-d features at 8×8
 - **Decoder**: 5 transposed conv layers → reconstruct 256×256 RGB
 - **Anomaly score**: Max pixel-wise MSE; threshold calibrated to a target overkill
-  rate on held-out normal images (`build_ae_threshold.py`)
+  rate on normal training images (`build_ae_threshold.py`; no test leakage, but
+  not held out from AE fitting)
 - *Intentionally a weak baseline* — see [Evaluation notes](#evaluation-notes--honest-limitations).
 
 ### PatchCore (SOTA)
@@ -258,6 +262,7 @@ graph BT
 ```
 defect-detection/
 ├── README.md
+├── .dockerignore                  # Excludes data/cache from Docker build context
 ├── requirements.txt
 ├── docker-compose.yml
 ├── data/                          # MVTec AD dataset (gitignored)

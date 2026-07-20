@@ -2,8 +2,8 @@
 
 Each /predict call scores the uploaded image with BOTH methods and returns their
 calibrated verdicts together, so the quality gap is visible in one response.
-Thresholds are calibrated leakage-free (held-out normal images only) by
-src/build_patchcore.py and src/build_ae_threshold.py.
+Thresholds are calibrated without touching the test set; PatchCore additionally
+holds its calibration normals out of the memory bank.
 
 Endpoints:
     GET  /health    — health check (which methods/category loaded)
@@ -131,12 +131,26 @@ def _heatmap_b64(error_map: np.ndarray) -> str:
     return base64.b64encode(buf).decode("utf-8")
 
 
+def _loaded_payload(state):
+    methods_loaded = {
+        "autoencoder": state["ae"] is not None,
+        "patchcore": state["patch"] is not None,
+    }
+    loaded = all(methods_loaded.values())
+    return {
+        "status": "healthy" if loaded else "unavailable",
+        "category": state["category"],
+        "device": state["device"],
+        "methods_loaded": methods_loaded,
+    }
+
+
 @torch.no_grad()
-def _score_ae(img_tensor):
-    recon = STATE["ae"]["model"](img_tensor)
+def _score_ae(img_tensor, ae_state):
+    recon = ae_state["model"](img_tensor)
     err = ((img_tensor - recon) ** 2).mean(dim=1).squeeze(0).cpu().numpy()
-    th = STATE["ae"]["threshold"]
-    m = STATE["ae"]["meta"]
+    th = ae_state["threshold"]
+    m = ae_state["meta"]
     return {
         "method": "autoencoder", "label": "Autoencoder (baseline)",
         "anomaly_score": round(float(err.max()), 4), "threshold": round(th, 4),
@@ -149,8 +163,8 @@ def _score_ae(img_tensor):
 
 
 @torch.no_grad()
-def _score_patchcore(img_tensor):
-    p = STATE["patch"]
+def _score_patchcore(img_tensor, patch_state):
+    p = patch_state
     m = patchcore_anomaly_map(p["extractor"], p["memory_bank"], img_tensor, p["size"])
     th = p["threshold"]
     meta = p["meta"]
@@ -169,21 +183,21 @@ def _score_patchcore(img_tensor):
 
 @app.get("/health")
 async def health():
-    return {
-        "status": "healthy",
-        "category": STATE["category"],
-        "device": STATE["device"],
-        "methods_loaded": {
-            "autoencoder": STATE["ae"] is not None,
-            "patchcore": STATE["patch"] is not None,
-        },
-    }
+    state = STATE.copy()
+    payload = _loaded_payload(state)
+    status_code = 200 if payload["status"] == "healthy" else 503
+    return JSONResponse(payload, status_code=status_code)
 
 
 @app.post("/predict")
 async def predict(file: UploadFile = File(..., description="Image (PNG/JPG)")):
     """Score the image with BOTH methods and return their calibrated verdicts."""
-    if STATE["ae"] is None or STATE["patch"] is None:
+    # Snapshot the model state once so a concurrent /load-model request cannot
+    # mix an AE from one category with a PatchCore bank from another.
+    state = STATE.copy()
+    ae_state = state["ae"]
+    patch_state = state["patch"]
+    if ae_state is None or patch_state is None:
         raise HTTPException(503, "Models not loaded")
 
     contents = await file.read()
@@ -192,12 +206,12 @@ async def predict(file: UploadFile = File(..., description="Image (PNG/JPG)")):
         raise HTTPException(400, "Invalid image file")
 
     img_rgb = opencv_preprocess(img_bgr, size=256)
-    img_tensor = TRANSFORM(img_rgb).unsqueeze(0).to(STATE["device"])
+    img_tensor = TRANSFORM(img_rgb).unsqueeze(0).to(state["device"])
 
-    ae = _score_ae(img_tensor)
-    pc = _score_patchcore(img_tensor)
+    ae = _score_ae(img_tensor, ae_state)
+    pc = _score_patchcore(img_tensor, patch_state)
     return JSONResponse({
-        "category": STATE["category"],
+        "category": state["category"],
         "image_size": list(img_bgr.shape[:2]),
         "methods": {"autoencoder": ae, "patchcore": pc},
         "methods_agree": ae["is_anomaly"] == pc["is_anomaly"],
